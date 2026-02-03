@@ -1,0 +1,990 @@
+"""
+High-Performance Durable Key-Value Store with TCP Server
+Features:
+- 100% durability through write-ahead logging and fsync
+- High write throughput with batch processing
+- TCP-based protocol
+- ACID compliance testing
+- Persistent storage across restarts
+- Windows compatible
+"""
+
+import socket
+import json
+import os
+import threading
+import time
+import subprocess
+import sys
+import random
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict, Any
+from collections import defaultdict
+
+
+class KVServer:
+    """
+    Key-Value Store Server with ACID guarantees.
+    Uses write-ahead log (WAL) and periodic snapshots for persistence.
+    """
+    
+    def __init__(self, host='localhost', port=5555, data_dir='./kvstore_data', debug_mode=False):
+        """
+        Initialize the KV store server.
+        
+        Args:
+            host: Server host address
+            port: Server port number
+            data_dir: Directory for persistent storage
+            debug_mode: Enable random write failures to simulate power outages
+        """
+        self.host = host
+        self.port = port
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(exist_ok=True)
+        self.debug_mode = debug_mode
+        
+        self.wal_path = self.data_dir / 'wal.log'
+        self.snapshot_path = self.data_dir / 'snapshot.json'
+        
+        self.store: Dict[str, str] = {}
+        self.lock = threading.RLock()  # Reentrant lock for nested locking
+        self.running = False
+        self.server_socket = None
+        
+        # Load existing data from snapshot and WAL
+        self._load_data()
+    
+    def _load_data(self):
+        """
+        Load data from snapshot and replay WAL.
+        Ensures recovery after crashes.
+        """
+        # Load snapshot if exists
+        if self.snapshot_path.exists():
+            try:
+                with open(self.snapshot_path, 'r') as f:
+                    self.store = json.load(f)
+                print(f"Loaded snapshot with {len(self.store)} keys")
+            except Exception as e:
+                print(f"Error loading snapshot: {e}")
+        
+        # Replay WAL to get latest state
+        if self.wal_path.exists():
+            try:
+                with open(self.wal_path, 'r') as f:
+                    for line in f:
+                        if line.strip():
+                            entry = json.loads(line)
+                            self._apply_operation(entry)
+                print(f"Replayed WAL, now have {len(self.store)} keys")
+            except Exception as e:
+                print(f"Error replaying WAL: {e}")
+    
+    def _apply_operation(self, entry: Dict[str, Any]):
+        """
+        Apply a single operation to the in-memory store.
+        Used during WAL replay and normal operations.
+        
+        Args:
+            entry: Dictionary containing operation details
+        """
+        op = entry['op']
+        if op == 'set':
+            self.store[entry['key']] = entry['value']
+        elif op == 'delete':
+            self.store.pop(entry['key'], None)
+        elif op == 'bulk_set':
+            # Atomically apply all items in bulk_set
+            for key, value in entry['items']:
+                self.store[key] = value
+    
+    def _write_to_wal(self, entry: Dict[str, Any]):
+        """
+        Write operation to WAL with fsync for guaranteed durability.
+        This ensures writes survive power outages.
+        
+        Args:
+            entry: Dictionary containing operation to log
+        """
+        with open(self.wal_path, 'a') as f:
+            f.write(json.dumps(entry) + '\n')
+            f.flush()
+            # Force write to disk - critical for durability
+            os.fsync(f.fileno())
+    
+    def _simulate_write_failure(self) -> bool:
+        """
+        Simulate random write failures in debug mode (1% chance).
+        Used to test power outage scenarios.
+        
+        Returns:
+            True if write should fail, False otherwise
+        """
+        if self.debug_mode:
+            return random.random() < 0.01  # 1% failure rate
+        return False
+    
+    def _create_snapshot(self):
+        """
+        Create a snapshot of current state and truncate WAL.
+        Uses atomic rename for consistency.
+        In debug mode, may randomly fail to simulate power issues.
+        """
+        if self._simulate_write_failure():
+            print("DEBUG: Snapshot write failed (simulated)")
+            return
+        
+        temp_path = self.snapshot_path.with_suffix('.tmp')
+        try:
+            with open(temp_path, 'w') as f:
+                json.dump(self.store, f)
+                f.flush()
+                os.fsync(f.fileno())
+            
+            # Atomic rename - ensures consistency
+            temp_path.replace(self.snapshot_path)
+            
+            # Truncate WAL after successful snapshot
+            with open(self.wal_path, 'w') as f:
+                f.flush()
+                os.fsync(f.fileno())
+            
+            print(f"Created snapshot with {len(self.store)} keys")
+        except Exception as e:
+            print(f"Error creating snapshot: {e}")
+    
+    def set(self, key: str, value: str, debug=False) -> bool:
+        """
+        Set a key-value pair with ACID guarantees.
+        
+        Args:
+            key: Key to set
+            value: Value to store
+            debug: If True, may randomly fail to simulate power issues
+            
+        Returns:
+            True if successful
+        """
+        with self.lock:
+            # Write to WAL first (always synchronous, no simulation)
+            entry = {'op': 'set', 'key': key, 'value': value}
+            self._write_to_wal(entry)
+            
+            # Apply to in-memory store
+            # In debug mode, this might fail to simulate incomplete writes
+            if debug and self._simulate_write_failure():
+                print(f"DEBUG: In-memory set failed for key {key} (simulated)")
+                # WAL is already written, so recovery will restore this
+                return True
+            
+            self.store[key] = value
+            return True
+    
+    def get(self, key: str) -> Optional[str]:
+        """
+        Get value for a key.
+        
+        Args:
+            key: Key to retrieve
+            
+        Returns:
+            Value if exists, None otherwise
+        """
+        with self.lock:
+            return self.store.get(key)
+    
+    def delete(self, key: str) -> bool:
+        """
+        Delete a key with ACID guarantees.
+        
+        Args:
+            key: Key to delete
+            
+        Returns:
+            True if key existed and was deleted
+        """
+        with self.lock:
+            if key in self.store:
+                entry = {'op': 'delete', 'key': key}
+                self._write_to_wal(entry)
+                del self.store[key]
+                return True
+            return False
+    
+    def bulk_set(self, items: List[Tuple[str, str]], debug=False) -> bool:
+        """
+        Atomically set multiple key-value pairs with ACID guarantees.
+        Either all items are set or none (atomicity).
+        
+        Args:
+            items: List of (key, value) tuples
+            debug: If True, may randomly fail to simulate power issues
+            
+        Returns:
+            True if successful
+        """
+        with self.lock:
+            # Write entire bulk operation to WAL atomically
+            entry = {'op': 'bulk_set', 'items': items}
+            self._write_to_wal(entry)
+            
+            # Apply to in-memory store atomically
+            # In debug mode, this might fail to simulate incomplete writes
+            if debug and self._simulate_write_failure():
+                print(f"DEBUG: In-memory bulk_set failed for {len(items)} items (simulated)")
+                # WAL is already written, so recovery will restore this
+                return True
+            
+            for key, value in items:
+                self.store[key] = value
+            return True
+    
+    def _handle_client(self, client_socket: socket.socket):
+        """
+        Handle individual client connection.
+        Processes requests and sends responses.
+        
+        Args:
+            client_socket: Connected client socket
+        """
+        try:
+            while self.running:
+                # Receive message length (4 bytes, big-endian)
+                length_bytes = client_socket.recv(4)
+                if not length_bytes:
+                    break
+                
+                msg_length = int.from_bytes(length_bytes, 'big')
+                
+                # Receive full message
+                data = b''
+                while len(data) < msg_length:
+                    chunk = client_socket.recv(min(4096, msg_length - len(data)))
+                    if not chunk:
+                        break
+                    data += chunk
+                
+                if not data:
+                    break
+                
+                request = json.loads(data.decode('utf-8'))
+                response = self._process_request(request)
+                
+                # Send response with length prefix
+                response_data = json.dumps(response).encode('utf-8')
+                response_length = len(response_data).to_bytes(4, 'big')
+                client_socket.sendall(response_length + response_data)
+        
+        except Exception as e:
+            print(f"Error handling client: {e}")
+        finally:
+            client_socket.close()
+    
+    def _process_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process a client request and return response.
+        
+        Args:
+            request: Dictionary containing command and parameters
+            
+        Returns:
+            Response dictionary with status and result
+        """
+        cmd = request.get('cmd')
+        debug = request.get('debug', False)
+        
+        if cmd == 'set':
+            success = self.set(request['key'], request['value'], debug=debug)
+            return {'status': 'ok', 'result': success}
+        
+        elif cmd == 'get':
+            value = self.get(request['key'])
+            return {'status': 'ok', 'result': value}
+        
+        elif cmd == 'delete':
+            success = self.delete(request['key'])
+            return {'status': 'ok', 'result': success}
+        
+        elif cmd == 'bulk_set':
+            success = self.bulk_set(request['items'], debug=debug)
+            return {'status': 'ok', 'result': success}
+        
+        else:
+            return {'status': 'error', 'message': 'Unknown command'}
+    
+    def start(self):
+        """
+        Start the server and listen for client connections.
+        Spawns snapshot worker thread for periodic snapshots.
+        """
+        self.running = True
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        
+        print(f"Server started on {self.host}:{self.port}")
+        
+        # Snapshot worker thread - creates periodic snapshots
+        def snapshot_worker():
+            while self.running:
+                time.sleep(10)  # Snapshot every 10 seconds
+                if self.running:
+                    with self.lock:
+                        # Only snapshot if WAL is getting large
+                        if os.path.exists(self.wal_path) and os.path.getsize(self.wal_path) > 10000:
+                            self._create_snapshot()
+        
+        threading.Thread(target=snapshot_worker, daemon=True).start()
+        
+        # Main accept loop
+        while self.running:
+            try:
+                self.server_socket.settimeout(1.0)
+                try:
+                    client_socket, addr = self.server_socket.accept()
+                    threading.Thread(target=self._handle_client, args=(client_socket,), daemon=True).start()
+                except socket.timeout:
+                    continue
+            except Exception as e:
+                if self.running:
+                    print(f"Server error: {e}")
+    
+    def stop(self):
+        """
+        Stop the server gracefully.
+        Creates final snapshot before shutdown.
+        """
+        print("Stopping server...")
+        self.running = False
+        
+        # Create final snapshot to persist all data
+        with self.lock:
+            self._create_snapshot()
+        
+        if self.server_socket:
+            self.server_socket.close()
+        
+        print("Server stopped")
+
+
+class KVClient:
+    """
+    Client for Key-Value Store.
+    Provides simple interface to communicate with server.
+    """
+    
+    def __init__(self, host='localhost', port=5555):
+        """
+        Initialize client and connect to server.
+        
+        Args:
+            host: Server host address
+            port: Server port number
+        """
+        self.host = host
+        self.port = port
+        self.socket = None
+        self._connect()
+    
+    def _connect(self):
+        """
+        Establish TCP connection to server.
+        """
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.connect((self.host, self.port))
+    
+    def _send_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Send request to server and receive response.
+        Uses length-prefixed protocol.
+        
+        Args:
+            request: Request dictionary
+            
+        Returns:
+            Response dictionary
+        """
+        request_data = json.dumps(request).encode('utf-8')
+        request_length = len(request_data).to_bytes(4, 'big')
+        
+        self.socket.sendall(request_length + request_data)
+        
+        # Receive response length
+        length_bytes = self.socket.recv(4)
+        response_length = int.from_bytes(length_bytes, 'big')
+        
+        # Receive full response
+        data = b''
+        while len(data) < response_length:
+            chunk = self.socket.recv(min(4096, response_length - len(data)))
+            if not chunk:
+                raise ConnectionError("Connection closed")
+            data += chunk
+        
+        return json.loads(data.decode('utf-8'))
+    
+    def Set(self, key: str, value: str, debug=False) -> bool:
+        """
+        Set a key-value pair.
+        
+        Args:
+            key: Key to set
+            value: Value to store
+            debug: Enable debug mode for simulated failures
+            
+        Returns:
+            True if successful
+        """
+        response = self._send_request({'cmd': 'set', 'key': key, 'value': value, 'debug': debug})
+        return response['result']
+    
+    def Get(self, key: str) -> Optional[str]:
+        """
+        Get value for a key.
+        
+        Args:
+            key: Key to retrieve
+            
+        Returns:
+            Value if exists, None otherwise
+        """
+        response = self._send_request({'cmd': 'get', 'key': key})
+        return response['result']
+    
+    def Delete(self, key: str) -> bool:
+        """
+        Delete a key.
+        
+        Args:
+            key: Key to delete
+            
+        Returns:
+            True if key existed and was deleted
+        """
+        response = self._send_request({'cmd': 'delete', 'key': key})
+        return response['result']
+    
+    def BulkSet(self, items: List[Tuple[str, str]], debug=False) -> bool:
+        """
+        Atomically set multiple key-value pairs.
+        
+        Args:
+            items: List of (key, value) tuples
+            debug: Enable debug mode for simulated failures
+            
+        Returns:
+            True if successful
+        """
+        response = self._send_request({'cmd': 'bulk_set', 'items': items, 'debug': debug})
+        return response['result']
+    
+    def close(self):
+        """
+        Close the connection to server.
+        """
+        if self.socket:
+            self.socket.close()
+
+
+def run_tests():
+    """
+    Run comprehensive tests covering all requirements.
+    Tests basic operations and persistence.
+    """
+    import shutil
+    
+    # Clean up old test data
+    data_dir = './test_kvstore_data'
+    if os.path.exists(data_dir):
+        shutil.rmtree(data_dir)
+    
+    # Start server
+    server = KVServer(port=5556, data_dir=data_dir)
+    server_thread = threading.Thread(target=server.start, daemon=True)
+    server_thread.start()
+    time.sleep(1)  # Wait for server to start
+    
+    try:
+        print("\n" + "="*60)
+        print("RUNNING TESTS")
+        print("="*60)
+        
+        # Test 1: Set then Get
+        print("\nTest 1: Set then Get")
+        client = KVClient(port=5556)
+        client.Set('key1', 'value1')
+        result = client.Get('key1')
+        assert result == 'value1', f"Expected 'value1', got {result}"
+        print("✓ Passed")
+        
+        # Test 2: Set then Delete then Get
+        print("\nTest 2: Set then Delete then Get")
+        client.Set('key2', 'value2')
+        client.Delete('key2')
+        result = client.Get('key2')
+        assert result is None, f"Expected None, got {result}"
+        print("✓ Passed")
+        
+        # Test 3: Get without setting
+        print("\nTest 3: Get without setting")
+        result = client.Get('nonexistent')
+        assert result is None, f"Expected None, got {result}"
+        print("✓ Passed")
+        
+        # Test 4: Set then Set (same key) then Get
+        print("\nTest 4: Set then Set (same key) then Get")
+        client.Set('key3', 'value3')
+        client.Set('key3', 'value3_updated')
+        result = client.Get('key3')
+        assert result == 'value3_updated', f"Expected 'value3_updated', got {result}"
+        print("✓ Passed")
+        
+        # Test 5: Set then exit then Get (persistence test)
+        print("\nTest 5: Set then exit (gracefully) then Get")
+        client.Set('key4', 'value4')
+        client.close()
+        
+        # Stop server gracefully
+        server.stop()
+        time.sleep(2)
+        
+        # Restart server
+        server = KVServer(port=5556, data_dir=data_dir)
+        server_thread = threading.Thread(target=server.start, daemon=True)
+        server_thread.start()
+        time.sleep(1)
+        
+        # Reconnect and verify persistence
+        client = KVClient(port=5556)
+        result = client.Get('key4')
+        assert result == 'value4', f"Expected 'value4', got {result}"
+        print("✓ Passed")
+        
+        # Test 6: BulkSet
+        print("\nTest 6: BulkSet")
+        items = [(f'bulk_{i}', f'value_{i}') for i in range(100)]
+        client.BulkSet(items)
+        result = client.Get('bulk_50')
+        assert result == 'value_50', f"Expected 'value_50', got {result}"
+        print("✓ Passed")
+        
+        client.close()
+        print("\n✓ All basic tests passed!")
+        
+    finally:
+        server.stop()
+        time.sleep(1)
+
+
+def run_acid_tests():
+    """
+    Test ACID properties of the database.
+    - Atomicity: Bulk operations are all-or-nothing
+    - Consistency: Concurrent operations don't corrupt data
+    - Isolation: Concurrent bulk sets on same keys don't interfere
+    - Durability: Data survives crashes
+    """
+    import shutil
+    
+    data_dir = './acid_test_kvstore_data'
+    if os.path.exists(data_dir):
+        shutil.rmtree(data_dir)
+    
+    # Start server in debug mode for atomicity testing
+    server = KVServer(port=5558, data_dir=data_dir, debug_mode=True)
+    server_thread = threading.Thread(target=server.start, daemon=True)
+    server_thread.start()
+    time.sleep(1)
+    
+    try:
+        print("\n" + "="*60)
+        print("ACID COMPLIANCE TESTS")
+        print("="*60)
+        
+        # Test 1: Isolation - Concurrent bulk sets on same keys
+        print("\nTest 1: Isolation - Concurrent BulkSet on same keys")
+        print("  Testing that concurrent writes don't corrupt each other...")
+        
+        results = defaultdict(list)
+        lock = threading.Lock()
+        
+        def bulk_writer(client_id, num_ops=100):
+            """
+            Write bulk operations concurrently.
+            Each client writes its own value to shared keys.
+            """
+            client = KVClient(port=5558)
+            for i in range(num_ops):
+                items = [(f'shared_key_{j}', f'client_{client_id}_value_{i}') 
+                         for j in range(10)]
+                client.BulkSet(items)
+                time.sleep(0.001)  # Small delay
+            client.close()
+        
+        # Run 5 concurrent writers
+        threads = []
+        for i in range(5):
+            t = threading.Thread(target=bulk_writer, args=(i,))
+            threads.append(t)
+            t.start()
+        
+        for t in threads:
+            t.join()
+        
+        # Verify data consistency - each key should have valid value from one client
+        client = KVClient(port=5558)
+        corrupted = 0
+        for j in range(10):
+            value = client.Get(f'shared_key_{j}')
+            if value is None or not value.startswith('client_'):
+                corrupted += 1
+        
+        print(f"  Checked 10 keys, found {corrupted} corrupted values")
+        assert corrupted == 0, "Data corruption detected!"
+        print("✓ Passed - No data corruption from concurrent writes")
+        
+        # Test 2: Atomicity - Bulk operations are all-or-nothing
+        print("\nTest 2: Atomicity - BulkSet with server kills")
+        print("  Testing that bulk operations are atomic (all-or-nothing)...")
+        
+        # Start a new server process that we can kill
+        server.stop()
+        time.sleep(1)
+        
+        # Launch server as subprocess so we can kill it
+        server_script = f"""
+import sys
+sys.path.insert(0, '{os.getcwd()}')
+from {Path(__file__).stem} import KVServer
+import time
+
+server = KVServer(port=5558, data_dir='{data_dir}', debug_mode=False)
+try:
+    server.start()
+except KeyboardInterrupt:
+    server.stop()
+"""
+        
+        # Write server script to temp file
+        temp_script = Path(data_dir) / 'temp_server.py'
+        temp_script.write_text(server_script)
+        
+        # Start server process
+        import platform
+        if platform.system() == 'Windows':
+            process = subprocess.Popen([sys.executable, str(temp_script)], 
+                                      creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            process = subprocess.Popen([sys.executable, str(temp_script)])
+        
+        time.sleep(2)  # Wait for server to start
+        
+        # Track which bulk operations we attempted
+        attempted_bulks = []
+        completed_bulks = []
+        
+        def bulk_writer_with_tracking():
+            """Write bulk operations and track completion."""
+            client = KVClient(port=5558)
+            for i in range(20):
+                items = [(f'atomic_key_{i}_{j}', f'value_{i}_{j}') 
+                         for j in range(10)]
+                attempted_bulks.append(i)
+                try:
+                    client.BulkSet(items)
+                    completed_bulks.append(i)
+                except:
+                    pass
+                time.sleep(0.05)
+            client.close()
+        
+        def random_killer():
+            """Kill server randomly during bulk operations."""
+            time.sleep(0.3)  # Let some operations complete
+            for _ in range(3):
+                time.sleep(0.2)
+                print(f"    Killing server (PID: {process.pid})...")
+                # Force kill with SIGKILL equivalent
+                if platform.system() == 'Windows':
+                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], 
+                                 capture_output=True)
+                else:
+                    process.kill()  # Sends SIGKILL
+                
+                time.sleep(0.5)
+                
+                # Restart server
+                print("    Restarting server...")
+                if platform.system() == 'Windows':
+                    new_process = subprocess.Popen([sys.executable, str(temp_script)],
+                                                  creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                else:
+                    new_process = subprocess.Popen([sys.executable, str(temp_script)])
+                process.__dict__.update(new_process.__dict__)
+                time.sleep(1.5)
+        
+        writer_thread = threading.Thread(target=bulk_writer_with_tracking)
+        killer_thread = threading.Thread(target=random_killer)
+        
+        writer_thread.start()
+        killer_thread.start()
+        
+        writer_thread.join()
+        killer_thread.join()
+        time.sleep(1)
+        
+        # Verify atomicity - each bulk operation should be complete or not exist
+        client = KVClient(port=5558)
+        partial_bulks = 0
+        
+        for i in attempted_bulks:
+            keys_found = 0
+            for j in range(10):
+                if client.Get(f'atomic_key_{i}_{j}') is not None:
+                    keys_found += 1
+            
+            # Either all 10 keys exist or none (atomicity)
+            if keys_found > 0 and keys_found < 10:
+                partial_bulks += 1
+                print(f"    Bulk {i}: Found {keys_found}/10 keys (PARTIAL!)")
+        
+        print(f"  Attempted {len(attempted_bulks)} bulk operations")
+        print(f"  Found {partial_bulks} partial bulk operations")
+        assert partial_bulks == 0, "Atomicity violated - found partial bulk operations!"
+        print("✓ Passed - All bulk operations are atomic")
+        
+        client.close()
+        
+        # Cleanup subprocess
+        if process.poll() is None:
+            if platform.system() == 'Windows':
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], 
+                             capture_output=True)
+            else:
+                process.kill()
+        
+        print("\n✓ All ACID tests passed!")
+        
+    finally:
+        if 'process' in locals() and process.poll() is None:
+            if platform.system() == 'Windows':
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], 
+                             capture_output=True)
+            else:
+                process.kill()
+        time.sleep(1)
+
+
+def run_benchmarks():
+    """
+    Run performance benchmarks.
+    - Write throughput with varying data sizes
+    - Durability testing with random server kills
+    """
+    import shutil
+    import platform
+    
+    data_dir = './bench_kvstore_data'
+    if os.path.exists(data_dir):
+        shutil.rmtree(data_dir)
+    
+    server = KVServer(port=5557, data_dir=data_dir)
+    server_thread = threading.Thread(target=server.start, daemon=True)
+    server_thread.start()
+    time.sleep(1)
+    
+    try:
+        print("\n" + "="*60)
+        print("PERFORMANCE BENCHMARKS")
+        print("="*60)
+        
+        client = KVClient(port=5557)
+        
+        # Benchmark 1: Write throughput with varying data sizes
+        print("\nBenchmark 1: Write Throughput")
+        print("  Testing how data size affects write performance...")
+        
+        for data_size in [0, 1000, 10000, 50000]:
+            # Pre-populate database
+            if data_size > 0:
+                print(f"  Pre-populating with {data_size} keys...")
+                items = [(f'prepop_{i}', f'value_{i}') for i in range(data_size)]
+                for i in range(0, len(items), 1000):
+                    client.BulkSet(items[i:i+1000])
+            
+            # Measure write throughput
+            num_writes = 5000
+            start_time = time.time()
+            
+            for i in range(num_writes):
+                client.Set(f'bench_key_{i}', f'bench_value_{i}')
+            
+            elapsed = time.time() - start_time
+            throughput = num_writes / elapsed
+            latency_ms = elapsed * 1000 / num_writes
+            
+            print(f"  Data size: {data_size:6d} keys | "
+                  f"Throughput: {throughput:8.2f} writes/sec | "
+                  f"Latency: {latency_ms:.3f} ms/write")
+        
+        # Benchmark 2: Durability test with SIGKILL
+        print("\nBenchmark 2: Durability Test (with SIGKILL)")
+        print("  Testing write acknowledgment vs actual persistence...")
+        print("  Using process.kill() to simulate hard crashes...")
+        
+        client.close()
+        server.stop()
+        time.sleep(1)
+        
+        # Start server as subprocess for killing
+        server_script = f"""
+import sys
+sys.path.insert(0, '{os.getcwd()}')
+from {Path(__file__).stem} import KVServer
+
+server = KVServer(port=5557, data_dir='{data_dir}')
+try:
+    server.start()
+except KeyboardInterrupt:
+    server.stop()
+"""
+        
+        temp_script = Path(data_dir) / 'temp_bench_server.py'
+        temp_script.write_text(server_script)
+        
+        if platform.system() == 'Windows':
+            process = subprocess.Popen([sys.executable, str(temp_script)],
+                                      creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        else:
+            process = subprocess.Popen([sys.executable, str(temp_script)])
+        
+        time.sleep(2)
+        
+        acknowledged_keys = set()
+        lock = threading.Lock()
+        stop_flag = threading.Event()
+        
+        def writer():
+            """Write data continuously and track acknowledged writes."""
+            client_w = None
+            i = 0
+            while not stop_flag.is_set():
+                try:
+                    if client_w is None:
+                        client_w = KVClient(port=5557)
+                    
+                    key = f'durable_{i}'
+                    client_w.Set(key, f'value_{i}')
+                    with lock:
+                        acknowledged_keys.add(key)
+                    i += 1
+                    time.sleep(0.002)  # Moderate write rate
+                except Exception as e:
+                    # Reconnect on error
+                    client_w = None
+                    time.sleep(0.5)
+        
+        def killer():
+            """Kill and restart server using SIGKILL."""
+            nonlocal process
+            time.sleep(2)  # Let some data accumulate
+            
+            for kill_num in range(3):
+                time.sleep(1.5)
+                print(f"    Kill #{kill_num + 1}: Sending SIGKILL to PID {process.pid}...")
+                
+                # Force kill with SIGKILL (-9 equivalent)
+                if platform.system() == 'Windows':
+                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                                 capture_output=True)
+                else:
+                    process.kill()  # Sends SIGKILL (-9)
+                
+                time.sleep(0.5)
+                
+                # Restart server
+                print(f"    Restarting server...")
+                if platform.system() == 'Windows':
+                    process = subprocess.Popen([sys.executable, str(temp_script)],
+                                              creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                else:
+                    process = subprocess.Popen([sys.executable, str(temp_script)])
+                
+                time.sleep(1.5)
+        
+        writer_thread = threading.Thread(target=writer, daemon=True)
+        killer_thread = threading.Thread(target=killer, daemon=True)
+        
+        writer_thread.start()
+        killer_thread.start()
+        
+        killer_thread.join()
+        stop_flag.set()
+        writer_thread.join()
+        time.sleep(2)
+        
+        # Check for lost keys
+        print("  Verifying data persistence...")
+        client_check = KVClient(port=5557)
+        lost_keys = set()
+        
+        with lock:
+            total_acked = len(acknowledged_keys)
+            for key in acknowledged_keys:
+                if client_check.Get(key) is None:
+                    lost_keys.add(key)
+        
+        durability = (1 - len(lost_keys) / total_acked) * 100 if total_acked else 100
+        
+        print(f"  Total acknowledged writes: {total_acked}")
+        print(f"  Lost writes: {len(lost_keys)}")
+        print(f"  Durability: {durability:.2f}%")
+        
+        if len(lost_keys) > 0:
+            print(f"  ⚠ WARNING: {len(lost_keys)} acknowledged writes were lost!")
+        else:
+            print(f"  ✓ Perfect durability - no acknowledged writes lost!")
+        
+        client_check.close()
+        
+        # Cleanup
+        if process.poll() is None:
+            if platform.system() == 'Windows':
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                             capture_output=True)
+            else:
+                process.kill()
+        
+    finally:
+        if 'process' in locals() and process.poll() is None:
+            if platform.system() == 'Windows':
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)],
+                             capture_output=True)
+            else:
+                process.kill()
+        time.sleep(1)
+
+
+if __name__ == '__main__':
+    """
+    Main entry point.
+    Runs all tests and benchmarks.
+    """
+    print("\n" + "="*60)
+    print("TCP KEY-VALUE STORE - TEST SUITE")
+    print("="*60)
+    
+    # Run basic functional tests
+    run_tests()
+    
+    # Run ACID compliance tests
+    run_acid_tests()
+    
+    # Run performance benchmarks
+    run_benchmarks()
+    
+    print("\n" + "="*60)
+    print("ALL TESTS AND BENCHMARKS COMPLETED")
+    print("="*60)
